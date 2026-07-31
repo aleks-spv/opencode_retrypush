@@ -1,0 +1,23 @@
+{
+  "name": "opencode-retry-now-plugin",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "OpenCode plugin that adds a /retry-now command to immediately retry rate-limited requests",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "prepare": "npm run build"
+  },
+  "keywords": ["opencode", "plugin", "retry", "rate limit"],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.15.7",
+    "@opencode-ai/sdk": "^1.15.7",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^1.0.0"
+  }
+}

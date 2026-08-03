@@ -1,5 +1,5 @@
 ---
-description: Immediately retry the last request, skipping the rate limit countdown
+description: Immediately retry all requests waiting on a rate limit countdown
 ---
 
-Retry the last failed request immediately.
+Retry every request currently waiting on a rate limit countdown immediately.

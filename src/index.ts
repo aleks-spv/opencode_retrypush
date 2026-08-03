@@ -2,7 +2,7 @@ import type { Plugin } from "@opencode-ai/plugin";
 
 const plugin: Plugin = async ({ client }) => {
   return {
-    "command.execute.before": async (input, _output) => {
+    "command.execute.before": async (input, output) => {
       if (input.command !== "retry-now") return;
 
       const result = await client.session.messages({
@@ -28,13 +28,13 @@ const plugin: Plugin = async ({ client }) => {
 
       if (!lastUserText) return;
 
-      // Re-send immediately, bypassing the rate-limit countdown
-      await client.session.promptAsync({
-        path: { id: input.sessionID },
-        body: {
-          parts: [{ type: "text", text: lastUserText }],
-        },
-      });
+      // Replace the command template with the prior request. Reusing its part
+      // preserves the IDs OpenCode assigned for this command execution.
+      const commandTextPart = output.parts.find((part) => part.type === "text");
+      if (!commandTextPart || commandTextPart.type !== "text") return;
+
+      commandTextPart.text = lastUserText;
+      output.parts.splice(0, output.parts.length, commandTextPart);
     },
   };
 };

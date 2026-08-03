@@ -8,7 +8,7 @@ When OpenCode hits a rate limit it shows a countdown timer. This plugin lets you
 
 1. Type `/retry-now` in the chat — the last user message is re-sent immediately.
 
-The plugin hooks into `command.execute.before`, retrieves the last user message from session history, and calls `session.promptAsync()` to re-send it right away.
+The plugin hooks into `command.execute.before`, retrieves the last user message from session history, and replaces the command content with it before OpenCode submits the request through its normal pipeline.
 
 ## Installation
 

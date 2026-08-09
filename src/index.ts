@@ -21,6 +21,12 @@ function toPromptParts(parts: Part[]): PromptPart[] {
     .map(({ id: _id, sessionID: _sid, messageID: _mid, ...rest }) => rest as PromptPart);
 }
 
+type LastUserPrompt = {
+  parts: PromptPart[];
+  agent?: string;
+  model?: { providerID: string; modelID: string };
+};
+
 /**
  * Find the user message that triggered the current retry.
  *
@@ -29,11 +35,11 @@ function toPromptParts(parts: Part[]): PromptPart[] {
  * more reliable than blindly grabbing the last user message, which may be a
  * queued follow-up or a different command entirely.
  */
-async function retryingUserParts(
+async function lastUserPrompt(
   client: { session: { messages: (args: { path: { id: string }; query?: { directory?: string } }) => Promise<{ data?: unknown[] }> } },
   sessionID: string,
   directory?: string,
-): Promise<PromptPart[] | null> {
+): Promise<LastUserPrompt | null> {
   const result = await client.session.messages({
     path: { id: sessionID },
     ...(directory ? { query: { directory } } : {}),
@@ -55,26 +61,44 @@ async function retryingUserParts(
 
   if (retryMessageIndex === -1) {
     // Fallback: no RetryPart found, use last user message.
-    return lastUserParts(client, sessionID, directory);
+    return lastUserPromptParts(client, sessionID, directory);
   }
 
   // Walk backwards from the retry message to find the user message.
   for (let i = retryMessageIndex - 1; i >= 0; i--) {
-    if (messages[i].info?.role === "user") {
-      const parts = messages[i].parts;
-      return parts.length > 0 ? toPromptParts(parts) : null;
+    const message = messages[i];
+    if (message.info?.role !== "user") continue;
+    const parts = message.parts as any[];
+    if (parts.length === 0) return null;
+
+    const info = message.info as any;
+    const prompt: LastUserPrompt = { parts: toPromptParts(parts) };
+
+    if (typeof info.agent === "string") {
+      prompt.agent = info.agent;
     }
+
+    if (
+      info.model &&
+      typeof info.model === "object" &&
+      typeof info.model.providerID === "string" &&
+      typeof info.model.modelID === "string"
+    ) {
+      prompt.model = { providerID: info.model.providerID, modelID: info.model.modelID };
+    }
+
+    return prompt;
   }
 
   return null;
 }
 
 /** Fallback: grab the last user message (oldest-first ordering). */
-async function lastUserParts(
+async function lastUserPromptParts(
   client: { session: { messages: (args: { path: { id: string }; query?: { directory?: string } }) => Promise<{ data?: unknown[] }> } },
   sessionID: string,
   directory?: string,
-): Promise<PromptPart[] | null> {
+): Promise<LastUserPrompt | null> {
   const result = await client.session.messages({
     path: { id: sessionID },
     ...(directory ? { query: { directory } } : {}),
@@ -85,9 +109,28 @@ async function lastUserParts(
   }>;
 
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].info?.role !== "user") continue;
-    const parts = messages[i].parts;
-    return parts.length > 0 ? toPromptParts(parts) : null;
+    const message = messages[i];
+    if (message.info?.role !== "user") continue;
+    const parts = message.parts as any[];
+    if (parts.length === 0) return null;
+
+    const info = message.info as any;
+    const prompt: LastUserPrompt = { parts: toPromptParts(parts) };
+
+    if (typeof info.agent === "string") {
+      prompt.agent = info.agent;
+    }
+
+    if (
+      info.model &&
+      typeof info.model === "object" &&
+      typeof info.model.providerID === "string" &&
+      typeof info.model.modelID === "string"
+    ) {
+      prompt.model = { providerID: info.model.providerID, modelID: info.model.modelID };
+    }
+
+    return prompt;
   }
 
   return null;
@@ -110,8 +153,8 @@ const plugin: Plugin = async ({ client, directory }) => {
       if (input.command !== "retry-now") return;
 
       // Get current session's user parts + all session statuses in parallel.
-      const [currentParts, statusResult] = await Promise.all([
-        retryingUserParts(client, input.sessionID, directory),
+      const [currentPrompt, statusResult] = await Promise.all([
+        lastUserPrompt(client, input.sessionID, directory),
         client.session.status(dirQuery),
       ]);
 
@@ -125,8 +168,8 @@ const plugin: Plugin = async ({ client, directory }) => {
         retrySessionIDs
           .filter((id) => id !== input.sessionID)
           .map(async (sessionID) => {
-            const parts = await retryingUserParts(client, sessionID, directory);
-            if (!parts || parts.length === 0) return;
+            const prompt = await lastUserPrompt(client, sessionID, directory);
+            if (!prompt) return;
 
             // Re-check: only abort+replay if still in retry state.
             const currentStatus = await client.session.status(dirQuery);
@@ -136,7 +179,11 @@ const plugin: Plugin = async ({ client, directory }) => {
             await client.session.abort({ path: { id: sessionID }, ...dirQuery });
             await client.session.promptAsync({
               path: { id: sessionID },
-              body: { parts },
+              body: {
+                ...(prompt.agent !== undefined ? { agent: prompt.agent } : {}),
+                ...(prompt.model !== undefined ? { model: prompt.model } : {}),
+                parts: prompt.parts,
+              },
               ...dirQuery,
             });
           }),
@@ -144,7 +191,7 @@ const plugin: Plugin = async ({ client, directory }) => {
       logRejected(otherResults, "remote session retry");
 
       // Handle current session.
-      if (!currentParts || currentParts.length === 0) return;
+      if (!currentPrompt) return;
 
       const currentStatus = await client.session.status(dirQuery);
       const myStatus = (currentStatus.data as Record<string, SessionStatus> | undefined)?.[input.sessionID];
@@ -152,11 +199,12 @@ const plugin: Plugin = async ({ client, directory }) => {
         await client.session.abort({ path: { id: input.sessionID }, ...dirQuery });
       }
 
-      // Replace the command's text part with the actual user prompt.
-      const commandTextPart = output.parts.find((p) => p.type === "text");
-      const commandParts = currentParts.map((p) => ({ ...p }));
-      const firstTextIndex = commandParts.findIndex((p) => p.type === "text");
-      if (commandTextPart?.type === "text" && firstTextIndex !== -1) {
+      // Reuse the command's text-part ID. All other parts are prompt inputs, so
+      // OpenCode assigns fresh IDs when it creates the replacement message.
+      const commandTextPart = output.parts.find((part) => part.type === "text");
+      const commandParts = currentPrompt.parts.map((part) => ({ ...part }));
+      const firstTextIndex = commandParts.findIndex((part) => part.type === "text");
+      if (commandTextPart && commandTextPart.type === "text" && firstTextIndex !== -1) {
         commandParts[firstTextIndex] = { ...commandTextPart, ...commandParts[firstTextIndex] };
       }
       output.parts.splice(0, output.parts.length, ...(commandParts as typeof output.parts));

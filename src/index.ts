@@ -21,6 +21,10 @@ function toPromptParts(parts: Part[]): PromptPart[] {
     .map(({ id: _id, sessionID: _sid, messageID: _mid, ...rest }) => rest as PromptPart);
 }
 
+const DEFAULT_MAX_RETRY_WAIT_MS = 300_000;
+const RETRY_MIN_REMAINING_MS = 30_000;
+const MAX_AUTOMATIC_BOUNCES = 3;
+
 type LastUserPrompt = {
   parts: PromptPart[];
   agent?: string;
@@ -145,10 +149,196 @@ function logRejected(results: PromiseSettledResult<unknown>[], context: string):
   }
 }
 
-const plugin: Plugin = async ({ client, directory }) => {
+type RetryStatus = {
+  type: "retry";
+  attempt: number;
+  message?: string;
+  next: number;
+  action?: unknown;
+};
+
+type RetryTimer = {
+  timer: ReturnType<typeof setTimeout>;
+  attempt: number;
+  next: number;
+};
+
+function maxRetryWaitMs(options: Record<string, unknown> | undefined): number | null {
+  const value = options?.maxRetryWaitMs;
+  if (value === false) return null;
+  if (typeof value !== "number" || !Number.isFinite(value)) return DEFAULT_MAX_RETRY_WAIT_MS;
+  return value > 0 ? value : null;
+}
+
+function retryStatus(status: unknown): RetryStatus | null {
+  if (!status || typeof status !== "object") return null;
+
+  const candidate = status as RetryStatus;
+  if (
+    candidate.type !== "retry" ||
+    typeof candidate.attempt !== "number" ||
+    !Number.isFinite(candidate.attempt) ||
+    typeof candidate.next !== "number" ||
+    !Number.isFinite(candidate.next)
+  ) {
+    return null;
+  }
+
+  return candidate;
+}
+
+function isUsageLimitRetry(status: RetryStatus): boolean {
+  if (status.action) return true;
+  return typeof status.message === "string" && /usage limit|free limit/i.test(status.message);
+}
+
+async function replayPrompt(client: any, sessionID: string, prompt: LastUserPrompt) {
+  await client.session.promptAsync({
+    path: { id: sessionID },
+    body: {
+      ...(prompt.agent !== undefined ? { agent: prompt.agent } : {}),
+      ...(prompt.model !== undefined ? { model: prompt.model } : {}),
+      parts: prompt.parts,
+    },
+  });
+}
+
+const plugin: Plugin = async ({ client, directory }, options) => {
   const dirQuery = directory ? { query: { directory } } : {};
 
+  const retryWaitCap = maxRetryWaitMs(options);
+  // A fixed 30s margin would make short caps mathematically inert. Scale it so
+  // waits only slightly longer than the cap are still worth taking over.
+  const retrySubstituteMargin = retryWaitCap === null ? 0 : Math.min(
+    RETRY_MIN_REMAINING_MS,
+    Math.max(1, retryWaitCap / 2),
+  );
+  const retryTimers = new Map<string, RetryTimer>();
+  const automaticBounces = new Map<string, number>();
+  const bouncesInFlight = new Set<string>();
+
+  function clearRetryTimer(sessionID: string) {
+    const scheduled = retryTimers.get(sessionID);
+    if (!scheduled) return;
+    clearTimeout(scheduled.timer);
+    retryTimers.delete(sessionID);
+  }
+
+  function clearRetryState(sessionID: string, resetBounces = true) {
+    clearRetryTimer(sessionID);
+    if (resetBounces) {
+      automaticBounces.delete(sessionID);
+    }
+  }
+
+  async function fireRetry(sessionID: string, scheduled: RetryTimer) {
+    if (retryTimers.get(sessionID) !== scheduled) return;
+    retryTimers.delete(sessionID);
+
+    const bounces = automaticBounces.get(sessionID) ?? 0;
+    if (bounces >= MAX_AUTOMATIC_BOUNCES) return;
+
+    bouncesInFlight.add(sessionID);
+    try {
+      const statusResult = await client.session.status();
+      const status = retryStatus(statusResult.data?.[sessionID]);
+      if (!status || status.attempt !== scheduled.attempt || status.next !== scheduled.next) return;
+      if (status.next - Date.now() < retrySubstituteMargin) return;
+
+      const prompt = await lastUserPrompt(client, sessionID, directory);
+      if (!prompt) return;
+
+      // Busy only means the replayed run started. The bounce budget resets on a
+      // terminal idle/deleted/error transition; abort's transient idle must not
+      // erase it while this operation is in flight.
+      automaticBounces.set(sessionID, bounces + 1);
+      await client.session.abort({ path: { id: sessionID } });
+      await replayPrompt(client, sessionID, prompt);
+    } catch {
+      clearRetryState(sessionID);
+    } finally {
+      bouncesInFlight.delete(sessionID);
+    }
+  }
+
+  function scheduleRetry(sessionID: string, statusValue: unknown) {
+    clearRetryTimer(sessionID);
+
+    if (retryWaitCap === null) return;
+
+    const status = retryStatus(statusValue);
+    if (!status || isUsageLimitRetry(status)) return;
+    if ((automaticBounces.get(sessionID) ?? 0) >= MAX_AUTOMATIC_BOUNCES) return;
+    if (status.next - Date.now() <= retryWaitCap + retrySubstituteMargin) return;
+
+    const timer = setTimeout(() => {
+      const scheduled = retryTimers.get(sessionID);
+      if (scheduled) return fireRetry(sessionID, scheduled);
+    }, retryWaitCap);
+    timer.unref?.();
+
+    retryTimers.set(sessionID, { timer, attempt: status.attempt, next: status.next });
+  }
+
+  // Do not query session status while OpenCode is loading plugins. That call
+  // re-enters the same per-instance bootstrap lock that is waiting for this
+  // plugin factory, deadlocking startup. OpenCode emits retry events after
+  // load, and pending retry fibers are in-process, so no state needs syncing
+  // at startup.
+
   return {
+    event: async ({ event }) => {
+      if (retryWaitCap === null) return;
+
+      try {
+        if (event.type === "session.status") {
+          const sessionID = event.properties.sessionID;
+          const status = event.properties.status as unknown;
+          if (typeof sessionID !== "string") return;
+
+          if ((status as any)?.type === "busy") {
+            clearRetryTimer(sessionID);
+          } else if ((status as any)?.type === "idle") {
+            clearRetryTimer(sessionID);
+            if (!bouncesInFlight.has(sessionID)) automaticBounces.delete(sessionID);
+          } else {
+            scheduleRetry(sessionID, status);
+          }
+          return;
+        }
+
+        if (event.type === "session.idle") {
+          const sessionID = event.properties.sessionID;
+          if (typeof sessionID !== "string") return;
+          clearRetryTimer(sessionID);
+          if (!bouncesInFlight.has(sessionID)) automaticBounces.delete(sessionID);
+          return;
+        }
+
+        if (event.type === "session.deleted") {
+          const sessionID = event.properties.info?.id;
+          if (typeof sessionID === "string") clearRetryState(sessionID);
+          return;
+        }
+
+        if (event.type === "session.error") {
+          const sessionID = event.properties.sessionID;
+          if (typeof sessionID === "string") clearRetryState(sessionID);
+        }
+      } catch {
+        // The event hook is fire-and-forget; never let it reject into OpenCode.
+      }
+    },
+
+    dispose: async () => {
+      for (const { timer } of retryTimers.values()) {
+        clearTimeout(timer);
+      }
+      retryTimers.clear();
+      automaticBounces.clear();
+      bouncesInFlight.clear();
+    },
+
     "command.execute.before": async (input, output) => {
       if (input.command !== "retry-now") return;
 
@@ -168,6 +358,8 @@ const plugin: Plugin = async ({ client, directory }) => {
         retrySessionIDs
           .filter((id) => id !== input.sessionID)
           .map(async (sessionID) => {
+            clearRetryTimer(sessionID);
+
             const prompt = await lastUserPrompt(client, sessionID, directory);
             if (!prompt) return;
 
@@ -196,6 +388,7 @@ const plugin: Plugin = async ({ client, directory }) => {
       const currentStatus = await client.session.status(dirQuery);
       const myStatus = (currentStatus.data as Record<string, SessionStatus> | undefined)?.[input.sessionID];
       if (myStatus?.type === "retry") {
+        clearRetryTimer(input.sessionID);
         await client.session.abort({ path: { id: input.sessionID }, ...dirQuery });
       }
 

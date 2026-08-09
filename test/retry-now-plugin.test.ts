@@ -213,4 +213,80 @@ describe("retry-now plugin", () => {
       },
     });
   });
+
+  it("preserves the original subagent agent and model when replaying a remote session", async () => {
+    const { client, hook } = await createHook({
+      messages: {
+        root: [userMessage("retry root")],
+        child: [{
+          info: {
+            role: "user",
+            agent: "research",
+            model: { providerID: "anthropic", modelID: "claude-opus-4-20250514" },
+          },
+          parts: [{ type: "text", text: "investigate the bug" }],
+        }],
+      },
+      statuses: { child: { type: "retry" } },
+    });
+    const output = { parts: structuredClone(commandParts) } as any;
+
+    await hook({ command: "retry-now", sessionID: "root", arguments: "" }, output);
+
+    expect(client.session.promptAsync).toHaveBeenCalledTimes(1);
+    expect(client.session.promptAsync).toHaveBeenCalledWith({
+      path: { id: "child" },
+      body: {
+        agent: "research",
+        model: { providerID: "anthropic", modelID: "claude-opus-4-20250514" },
+        parts: [{ type: "text", text: "investigate the bug" }],
+      },
+    });
+  });
+
+  it("preserves agent even when model is absent on the last user message", async () => {
+    const { client, hook } = await createHook({
+      messages: {
+        root: [userMessage("retry root")],
+        child: [{
+          info: { role: "user", agent: "research" },
+          parts: [{ type: "text", text: "investigate the bug" }],
+        }],
+      },
+      statuses: { child: { type: "retry" } },
+    });
+    const output = { parts: structuredClone(commandParts) } as any;
+
+    await hook({ command: "retry-now", sessionID: "root", arguments: "" }, output);
+
+    expect(client.session.promptAsync).toHaveBeenCalledWith({
+      path: { id: "child" },
+      body: {
+        agent: "research",
+        parts: [{ type: "text", text: "investigate the bug" }],
+      },
+    });
+  });
+
+  it("omits agent and model from the replay body when absent on the last user message", async () => {
+    const { client, hook } = await createHook({
+      messages: {
+        root: [userMessage("retry root")],
+        child: [{
+          info: { role: "user" },
+          parts: [{ type: "text", text: "investigate the bug" }],
+        }],
+      },
+      statuses: { child: { type: "retry" } },
+    });
+    const output = { parts: structuredClone(commandParts) } as any;
+
+    await hook({ command: "retry-now", sessionID: "root", arguments: "" }, output);
+
+    const call = client.session.promptAsync.mock.calls[0]?.[0] as { body: Record<string, unknown> };
+    expect(call).toBeDefined();
+    expect(call.body).toEqual({ parts: [{ type: "text", text: "investigate the bug" }] });
+    expect("agent" in call.body).toBe(false);
+    expect("model" in call.body).toBe(false);
+  });
 });

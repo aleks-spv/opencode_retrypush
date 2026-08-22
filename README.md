@@ -15,8 +15,8 @@ The plugin hooks into `command.execute.before`, finds every OpenCode session in 
 ### 1. Clone and build the plugin
 
 ```sh
-git clone https://github.com/aleks-spv/opencode_retrypush.git /home/openchamber/workspaces/opencode_retrypush
-cd /home/openchamber/workspaces/opencode_retrypush
+git clone https://github.com/aleks-spv/opencode_retrypush.git
+cd opencode_retrypush
 npm install
 npm run build
 ```
@@ -26,19 +26,26 @@ npm run build
 ```json
 {
   "plugin": [
-    "file:///home/openchamber/workspaces/opencode_retrypush/dist/index.js"
+    "file:///absolute/path/to/opencode_retrypush/dist/index.js"
   ]
 }
 ```
 
+Replace the path above with the actual absolute path to your clone.
+
 ### 3. Copy the slash command file
 
-The `/retry-now` command must exist as a file in `~/.config/opencode/command/`:
+The `/retry-now` command must exist as a file in `~/.config/opencode/commands/`:
 
 ```sh
-mkdir -p ~/.config/opencode/command
-cp /home/openchamber/workspaces/opencode_retrypush/command/retry-now.md ~/.config/opencode/command/retry-now.md
+mkdir -p ~/.config/opencode/commands
+cp ./commands/retry-now.md ~/.config/opencode/commands/retry-now.md
 ```
+
+> **Note:** OpenCode reads both `command/` (legacy) and `commands/` via a brace-glob.
+> New commands should go into `commands/`. If you have a stale copy in the old
+> `command/` directory, delete it to avoid confusion:
+> `rm ~/.config/opencode/command/retry-now.md`
 
 ### 4. Restart OpenCode
 

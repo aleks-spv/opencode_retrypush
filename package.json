@@ -8,10 +8,15 @@
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
-    "prepare": "npm run build"
+    "prepublishOnly": "npm run build"
   },
   "keywords": ["opencode", "plugin", "retry", "rate limit"],
-  "author": "",
+  "author": "aleks-spv",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aleks-spv/opencode_retrypush.git"
+  },
+  "files": ["dist", "commands"],
   "license": "MIT",
   "devDependencies": {
     "@opencode-ai/plugin": "^1.15.7",

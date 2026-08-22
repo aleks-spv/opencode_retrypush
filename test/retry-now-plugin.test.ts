@@ -213,4 +213,131 @@ describe("retry-now plugin", () => {
       },
     });
   });
+
+  it("filters out non-prompt parts (tool, step-start, etc.)", async () => {
+    const { hook } = await createHook({
+      messages: {
+        root: [{
+          info: { role: "user" },
+          parts: [
+            { type: "text", text: "do something" },
+            { type: "tool", id: "t1", sessionID: "s", messageID: "m", tool: "bash", state: { status: "completed", input: {}, output: "" } },
+            { type: "step-start", id: "ss1", sessionID: "s", messageID: "m" },
+            { type: "file", id: "f1", sessionID: "s", messageID: "m", mime: "text/plain", url: "file:///tmp/x.txt" },
+          ],
+        }],
+      },
+    });
+    const output = { parts: structuredClone(commandParts) } as any;
+
+    await hook({ command: "retry-now", sessionID: "root", arguments: "" }, output);
+
+    expect(output.parts).toEqual([
+      { ...commandParts[0], text: "do something" },
+      { type: "file", mime: "text/plain", url: "file:///tmp/x.txt" },
+    ]);
+  });
+
+  it("uses RetryPart to find the correct user message", async () => {
+    const { hook } = await createHook({
+      messages: {
+        root: [
+          userMessage("first prompt"),
+          { info: { role: "assistant" }, parts: [{ type: "text", id: "a1", sessionID: "root", messageID: "m1", text: "working..." }] },
+          { info: { role: "user" }, parts: [{ type: "text", text: "second prompt" }] },
+          { info: { role: "assistant" }, parts: [
+            { type: "text", id: "a2", sessionID: "root", messageID: "m2", text: "rate limited" },
+            { type: "retry", id: "r1", sessionID: "root", messageID: "m2", attempt: 1, error: { name: "APIError", data: { message: "rate limited", isRetryable: true } }, time: { created: Date.now() } },
+          ] },
+        ],
+      },
+    });
+    const output = { parts: structuredClone(commandParts) } as any;
+
+    await hook({ command: "retry-now", sessionID: "root", arguments: "" }, output);
+
+    expect(output.parts).toEqual([{ ...commandParts[0], text: "second prompt" }]);
+  });
+
+  it("passes directory query to SDK calls when directory is provided", async () => {
+    const client = {
+      session: {
+        messages: vi.fn().mockResolvedValue({ data: [{ info: { role: "user" }, parts: [{ type: "text", text: "hello" }] }] }),
+        status: vi.fn().mockResolvedValue({ data: {} }),
+        abort: vi.fn().mockResolvedValue({}),
+        promptAsync: vi.fn().mockResolvedValue({}),
+      },
+    };
+    const hooks = await RetryNowPlugin({ client, directory: "/my/project", project: {} as any, worktree: "", experimental_workspace: {} as any, serverUrl: new URL("http://localhost"), $: {} as any });
+    const hook = hooks["command.execute.before"];
+    if (!hook) throw new Error("no hook");
+
+    const output = { parts: structuredClone(commandParts) } as any;
+    await hook({ command: "retry-now", sessionID: "root", arguments: "" }, output);
+
+    expect(client.session.messages).toHaveBeenCalledWith({
+      path: { id: "root" },
+      query: { directory: "/my/project" },
+    });
+    expect(client.session.status).toHaveBeenCalledWith({
+      query: { directory: "/my/project" },
+    });
+  });
+
+  it("retries a child session that is in retry state (subagent scenario)", async () => {
+    const { client, hook } = await createHook({
+      messages: {
+        child: [userMessage("retry child prompt")],
+      },
+      statuses: { child: { type: "retry" } },
+    });
+    const output = { parts: structuredClone(commandParts) } as any;
+
+    await hook({ command: "retry-now", sessionID: "child", arguments: "" }, output);
+
+    expect(output.parts).toEqual([{ ...commandParts[0], text: "retry child prompt" }]);
+    expect(client.session.abort).toHaveBeenCalledWith({ path: { id: "child" } });
+  });
+
+  it("retries both parent and child when both are in retry state", async () => {
+    const { client, hook } = await createHook({
+      messages: {
+        parent: [userMessage("parent prompt")],
+        child: [userMessage("child prompt")],
+      },
+      statuses: { parent: { type: "retry" }, child: { type: "retry" } },
+    });
+    const output = { parts: structuredClone(commandParts) } as any;
+
+    await hook({ command: "retry-now", sessionID: "parent", arguments: "" }, output);
+
+    expect(client.session.abort).toHaveBeenCalledWith({ path: { id: "parent" } });
+    expect(client.session.abort).toHaveBeenCalledWith({ path: { id: "child" } });
+    expect(client.session.promptAsync).toHaveBeenCalledWith({
+      path: { id: "child" },
+      body: { parts: [{ type: "text", text: "child prompt" }] },
+    });
+  });
+
+  it("returns all part types that satisfy the prompt contract", async () => {
+    const { hook } = await createHook({
+      messages: {
+        root: [{
+          info: { role: "user" },
+          parts: [
+            { type: "text", text: "check this" },
+            { type: "file", id: "f1", sessionID: "s", messageID: "m", mime: "image/png", url: "file:///img.png" },
+            { type: "agent", id: "ag1", sessionID: "s", messageID: "m", name: "explore" },
+            { type: "subtask", id: "st1", sessionID: "s", messageID: "m", prompt: "find x", description: "search", agent: "explore" },
+          ],
+        }],
+      },
+    });
+    const output = { parts: structuredClone(commandParts) } as any;
+
+    await hook({ command: "retry-now", sessionID: "root", arguments: "" }, output);
+
+    const partTypes = output.parts.map((p: any) => p.type);
+    expect(partTypes).toEqual(["text", "file", "agent", "subtask"]);
+  });
 });

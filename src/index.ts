@@ -1,72 +1,162 @@
 import type { Plugin } from "@opencode-ai/plugin";
+import type {
+  Part,
+  TextPartInput,
+  FilePartInput,
+  AgentPartInput,
+  SubtaskPartInput,
+  SessionStatus,
+  RetryPart,
+} from "@opencode-ai/sdk";
 
-function asPromptParts(parts: any[]): any[] {
-  return parts.map(({ id, sessionID, messageID, ...part }) => part);
+/** Types accepted by session.promptAsync / session.prompt. */
+type PromptPart = TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput;
+
+const ALLOWED_PART_TYPES = new Set<string>(["text", "file", "agent", "subtask"]);
+
+/** Strip server-only fields and keep only prompt-compatible parts. */
+function toPromptParts(parts: Part[]): PromptPart[] {
+  return parts
+    .filter((p) => ALLOWED_PART_TYPES.has(p.type))
+    .map(({ id: _id, sessionID: _sid, messageID: _mid, ...rest }) => rest as PromptPart);
 }
 
-async function lastUserParts(client: any, sessionID: string): Promise<any[] | null> {
+/**
+ * Find the user message that triggered the current retry.
+ *
+ * Strategy: locate the latest `RetryPart` in the session history, then walk
+ * backwards to find the user message that immediately precedes it.  This is
+ * more reliable than blindly grabbing the last user message, which may be a
+ * queued follow-up or a different command entirely.
+ */
+async function retryingUserParts(
+  client: { session: { messages: (args: { path: { id: string }; query?: { directory?: string } }) => Promise<{ data?: unknown[] }> } },
+  sessionID: string,
+  directory?: string,
+): Promise<PromptPart[] | null> {
   const result = await client.session.messages({
     path: { id: sessionID },
+    ...(directory ? { query: { directory } } : {}),
   });
-  const messages = result.data ?? [];
+  const messages = (result.data ?? []) as Array<{
+    info?: { role?: string };
+    parts: Part[];
+  }>;
 
-  // Messages are oldest-first.
+  // Walk backwards to find the latest RetryPart.
+  let retryMessageIndex = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
-    const message = messages[i] as any;
-    if (message.info?.role !== "user") continue;
+    const parts = messages[i].parts ?? [];
+    if (parts.some((p): p is RetryPart => p.type === "retry")) {
+      retryMessageIndex = i;
+      break;
+    }
+  }
 
-    const parts = message.parts as any[];
-    return parts.length > 0 ? asPromptParts(parts) : null;
+  if (retryMessageIndex === -1) {
+    // Fallback: no RetryPart found, use last user message.
+    return lastUserParts(client, sessionID, directory);
+  }
+
+  // Walk backwards from the retry message to find the user message.
+  for (let i = retryMessageIndex - 1; i >= 0; i--) {
+    if (messages[i].info?.role === "user") {
+      const parts = messages[i].parts;
+      return parts.length > 0 ? toPromptParts(parts) : null;
+    }
   }
 
   return null;
 }
 
-const plugin: Plugin = async ({ client }) => {
+/** Fallback: grab the last user message (oldest-first ordering). */
+async function lastUserParts(
+  client: { session: { messages: (args: { path: { id: string }; query?: { directory?: string } }) => Promise<{ data?: unknown[] }> } },
+  sessionID: string,
+  directory?: string,
+): Promise<PromptPart[] | null> {
+  const result = await client.session.messages({
+    path: { id: sessionID },
+    ...(directory ? { query: { directory } } : {}),
+  });
+  const messages = (result.data ?? []) as Array<{
+    info?: { role?: string };
+    parts: Part[];
+  }>;
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].info?.role !== "user") continue;
+    const parts = messages[i].parts;
+    return parts.length > 0 ? toPromptParts(parts) : null;
+  }
+
+  return null;
+}
+
+/** Log and surface errors from Promise.allSettled results. */
+function logRejected(results: PromiseSettledResult<unknown>[], context: string): void {
+  for (const r of results) {
+    if (r.status === "rejected") {
+      console.error(`[retry-now] ${context}:`, r.reason);
+    }
+  }
+}
+
+const plugin: Plugin = async ({ client, directory }) => {
+  const dirQuery = directory ? { query: { directory } } : {};
+
   return {
     "command.execute.before": async (input, output) => {
       if (input.command !== "retry-now") return;
 
+      // Get current session's user parts + all session statuses in parallel.
       const [currentParts, statusResult] = await Promise.all([
-        lastUserParts(client, input.sessionID),
-        client.session.status(),
+        retryingUserParts(client, input.sessionID, directory),
+        client.session.status(dirQuery),
       ]);
 
-      const retrySessionIDs = Object.entries(statusResult.data ?? {})
-        .filter(([, status]: [string, any]) => status.type === "retry")
-        .map(([sessionID]) => sessionID);
+      const statuses = (statusResult.data ?? {}) as Record<string, SessionStatus>;
+      const retrySessionIDs = Object.entries(statuses)
+        .filter(([, s]) => s.type === "retry")
+        .map(([id]) => id);
 
-      await Promise.allSettled(
+      // Retry every *other* rate-limited session.
+      const otherResults = await Promise.allSettled(
         retrySessionIDs
-          .filter((sessionID) => sessionID !== input.sessionID)
+          .filter((id) => id !== input.sessionID)
           .map(async (sessionID) => {
-            const parts = await lastUserParts(client, sessionID);
-            if (!parts) return;
+            const parts = await retryingUserParts(client, sessionID, directory);
+            if (!parts || parts.length === 0) return;
 
-            const currentStatus = await client.session.status();
-            if (currentStatus.data?.[sessionID]?.type !== "retry") return;
+            // Re-check: only abort+replay if still in retry state.
+            const currentStatus = await client.session.status(dirQuery);
+            const sessionStatus = (currentStatus.data as Record<string, SessionStatus> | undefined)?.[sessionID];
+            if (sessionStatus?.type !== "retry") return;
 
-            await client.session.abort({ path: { id: sessionID } });
+            await client.session.abort({ path: { id: sessionID }, ...dirQuery });
             await client.session.promptAsync({
               path: { id: sessionID },
               body: { parts },
+              ...dirQuery,
             });
           }),
       );
+      logRejected(otherResults, "remote session retry");
 
-      if (!currentParts) return;
+      // Handle current session.
+      if (!currentParts || currentParts.length === 0) return;
 
-      const currentStatus = await client.session.status();
-      if (currentStatus.data?.[input.sessionID]?.type === "retry") {
-        await client.session.abort({ path: { id: input.sessionID } });
+      const currentStatus = await client.session.status(dirQuery);
+      const myStatus = (currentStatus.data as Record<string, SessionStatus> | undefined)?.[input.sessionID];
+      if (myStatus?.type === "retry") {
+        await client.session.abort({ path: { id: input.sessionID }, ...dirQuery });
       }
 
-      // Reuse the command's text-part ID. All other parts are prompt inputs, so
-      // OpenCode assigns fresh IDs when it creates the replacement message.
-      const commandTextPart = output.parts.find((part) => part.type === "text");
-      const commandParts = currentParts.map((part) => ({ ...part }));
-      const firstTextIndex = commandParts.findIndex((part) => part.type === "text");
-      if (commandTextPart && commandTextPart.type === "text" && firstTextIndex !== -1) {
+      // Replace the command's text part with the actual user prompt.
+      const commandTextPart = output.parts.find((p) => p.type === "text");
+      const commandParts = currentParts.map((p) => ({ ...p }));
+      const firstTextIndex = commandParts.findIndex((p) => p.type === "text");
+      if (commandTextPart?.type === "text" && firstTextIndex !== -1) {
         commandParts[firstTextIndex] = { ...commandTextPart, ...commandParts[firstTextIndex] };
       }
       output.parts.splice(0, output.parts.length, ...(commandParts as typeof output.parts));

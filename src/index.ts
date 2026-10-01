@@ -8,6 +8,7 @@ import type {
   SessionStatus,
   RetryPart,
 } from "@opencode-ai/sdk";
+import { DEFAULT_MAX_RETRY_WAIT_MS, RETRY_MIN_REMAINING_MS, MAX_AUTOMATIC_BOUNCES, parseMaxRetryWaitMs, armMargin, isUsageLimitMessage } from "./shared.js";
 
 /** Types accepted by session.promptAsync / session.prompt. */
 type PromptPart = TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput;
@@ -20,10 +21,6 @@ function toPromptParts(parts: Part[]): PromptPart[] {
     .filter((p) => ALLOWED_PART_TYPES.has(p.type))
     .map(({ id: _id, sessionID: _sid, messageID: _mid, ...rest }) => rest as PromptPart);
 }
-
-const DEFAULT_MAX_RETRY_WAIT_MS = 300_000;
-const RETRY_MIN_REMAINING_MS = 30_000;
-const MAX_AUTOMATIC_BOUNCES = 3;
 
 type LastUserPrompt = {
   parts: PromptPart[];
@@ -163,13 +160,6 @@ type RetryTimer = {
   next: number;
 };
 
-function maxRetryWaitMs(options: Record<string, unknown> | undefined): number | null {
-  const value = options?.maxRetryWaitMs;
-  if (value === false) return null;
-  if (typeof value !== "number" || !Number.isFinite(value)) return DEFAULT_MAX_RETRY_WAIT_MS;
-  return value > 0 ? value : null;
-}
-
 function retryStatus(status: unknown): RetryStatus | null {
   if (!status || typeof status !== "object") return null;
 
@@ -189,7 +179,7 @@ function retryStatus(status: unknown): RetryStatus | null {
 
 function isUsageLimitRetry(status: RetryStatus): boolean {
   if (status.action) return true;
-  return typeof status.message === "string" && /usage limit|free limit/i.test(status.message);
+  return isUsageLimitMessage(status.message);
 }
 
 async function replayPrompt(client: any, sessionID: string, prompt: LastUserPrompt) {
@@ -206,13 +196,10 @@ async function replayPrompt(client: any, sessionID: string, prompt: LastUserProm
 const plugin: Plugin = async ({ client, directory }, options) => {
   const dirQuery = directory ? { query: { directory } } : {};
 
-  const retryWaitCap = maxRetryWaitMs(options);
+  const retryWaitCap = parseMaxRetryWaitMs(options);
   // A fixed 30s margin would make short caps mathematically inert. Scale it so
   // waits only slightly longer than the cap are still worth taking over.
-  const retrySubstituteMargin = retryWaitCap === null ? 0 : Math.min(
-    RETRY_MIN_REMAINING_MS,
-    Math.max(1, retryWaitCap / 2),
-  );
+  const retrySubstituteMargin = armMargin(retryWaitCap);
   const retryTimers = new Map<string, RetryTimer>();
   const automaticBounces = new Map<string, number>();
   const bouncesInFlight = new Set<string>();

@@ -57,12 +57,9 @@ declare module "@opencode/plugin" {
     }
   }
 
-  export interface SessionRetryDecision {
-    retry: false;
-  } | {
-    retry: true;
-    delay: number;
-  }
+  export type SessionRetryDecision = 
+    | { retry: false }
+    | { retry: true; delay: number };
 
   export interface SessionRetry {
     readonly sessionID: string;
@@ -116,7 +113,7 @@ declare module "@opencode/plugin" {
   }
 
   export interface CommandDomain {
-    readonly transform: (callback: (input: CommandEditor) => void) => Promise<Registration>;
+    readonly transform: (callback: (input: CommandEditor) => void | Promise<void>) => Promise<Registration>;
     reload(): Promise<void>;
   }
 }

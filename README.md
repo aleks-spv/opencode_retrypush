@@ -64,3 +64,19 @@ When rate-limited, type `/retry-now` in any session and press Enter. The command
 
 - OpenCode with `@opencode-ai/plugin` ≥ 1.15.7
 - Node.js ≥ 18
+
+## Keyboard shortcut (optional)
+
+You can bind `/retry-now` to a keyboard shortcut so you don't have to type it. OpenCode supports keybinding custom slash commands via the `keybinds` config once [opencode#5903](https://github.com/anomalyco/opencode/pull/5903) lands. Add this to your `opencode.json`:
+
+```json
+{
+  "keybinds": {
+    "/retry-now": "ctrl+alt+r"
+  }
+}
+```
+
+Pressing the shortcut types `/retry-now` into the prompt and submits it, retrying every rate-limited session immediately. `ctrl+alt+r` is a suggested default — pick any combo that does not collide with your terminal's bindings.
+
+> **Note:** this requires an OpenCode version that includes [PR #5903](https://github.com/anomalyco/opencode/pull/5903). Until then, use `/retry-now` manually or bind it via your terminal emulator (e.g. a custom escape sequence that opens an input with `/retry-now` typed).

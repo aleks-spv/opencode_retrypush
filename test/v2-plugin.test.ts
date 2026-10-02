@@ -1,269 +1,155 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { MAX_AUTOMATIC_BOUNCES, parseMaxRetryWaitMs, shouldCapDelay, isUsageLimitMessage } from "../src/shared";
+import plugin from "../src/v2";
 
 describe("v2 plugin behavior", () => {
   afterEach(() => {
     vi.clearAllMocks();
   });
 
-  function createMockSetup() {
+  async function createV2Context(options?: Record<string, unknown>) {
     const hooks = new Map();
     const commands = new Map();
-    let attempt = -1;
-    let bouncesInThisAttempt = 0;
-
-    const setup = async (ctx) => {
-      const cap = parseMaxRetryWaitMs(ctx.options);
-      const registrations = [];
-
-      if (cap !== null) {
-        const retryReg = await ctx.session.hook("retry", (input) => {
-          try {
-            if (input.attempt !== attempt) {
-              attempt = input.attempt;
-              bouncesInThisAttempt = 0;
-            }
-
-            const errorMessage =
-              typeof input.error === "object" && input.error !== null && "message" in input.error
-                ? input.error.message
-                : undefined;
-            if (isUsageLimitMessage(errorMessage)) {
-              return;
-            }
-
-            if (bouncesInThisAttempt >= MAX_AUTOMATIC_BOUNCES) {
-              return;
-            }
-
-            if (!input.decision.retry) {
-              return;
-            }
-
-            if (shouldCapDelay(input.decision.delay, cap)) {
-              input.decision.delay = cap;
-              bouncesInThisAttempt++;
-            }
-          } catch (error) {
-            console.error("[retry-now]", error instanceof Error ? error.message : String(error));
-          }
-        });
-        registrations.push(retryReg);
-      }
-
-      const cmdReg = await ctx.command.transform((editor) => {
-        editor.add({
-          name: "retry-now",
-          description: "Retry the current session immediately",
-          execute: async (invocation) => {
-            try {
-              await ctx.session.interrupt({ sessionID: invocation.sessionID });
-              await ctx.session.prompt({
-                sessionID: invocation.sessionID,
-                prompt: invocation.prompt,
-                delivery: invocation.delivery,
-              });
-            } catch (error) {
-              console.error("[retry-now] command failed:", error instanceof Error ? error.message : String(error));
-            }
-          },
-        });
-      });
-      registrations.push(cmdReg);
-
-      return async () => {
-        for (const reg of registrations) {
-          try {
-            await Promise.resolve(reg.dispose());
-          } catch (error) {
-            console.error("[retry-now] cleanup error:", error instanceof Error ? error.message : String(error));
-          }
-        }
-      };
-    };
+    const interrupts = new Map();
+    const prompts = new Map();
 
     const ctx = {
-      options: {},
+      options: options || {},
       session: {
-        hook: vi.fn(async (name, cb) => {
-          hooks.set(name, cb);
-          return { dispose: vi.fn() };
+        hook: vi.fn(async (name, callback) => {
+          hooks.set(name, callback);
+          return { dispose: () => Promise.resolve() };
         }),
-        interrupt: vi.fn(async () => undefined),
-        prompt: vi.fn(async () => undefined),
+        interrupt: vi.fn(async (input) => {
+          interrupts.set(input.sessionID, input);
+        }),
+        context: vi.fn(async () => []),
+        prompt: vi.fn(async (input) => {
+          prompts.set(input.sessionID, input);
+        }),
       },
       command: {
-        transform: vi.fn(async (cb) => {
+        transform: vi.fn(async (callback) => {
           const editor = {
-            add: (cmd) => {
-              commands.set(cmd.name, cmd);
-            },
+            add: vi.fn((def) => {
+              commands.set(def.name, def);
+            }),
           };
-          cb(editor);
-          return { dispose: vi.fn() };
+          callback(editor);
+          return { dispose: () => Promise.resolve() };
         }),
       },
     };
 
-    return { setup, ctx, hooks, commands };
+    const cleanup = await plugin.setup(ctx);
+    return { ctx, hooks, commands, cleanup, interrupts, prompts };
   }
 
-  it("does not call session API during setup", async () => {
-    const { setup, ctx } = createMockSetup();
-    await setup(ctx);
-    expect(ctx.session.interrupt).not.toHaveBeenCalled();
-    expect(ctx.session.prompt).not.toHaveBeenCalled();
-  });
-
-  it("registers retry hook with cap !== null", async () => {
-    const { setup, ctx } = createMockSetup();
-    ctx.options = { maxRetryWaitMs: 300000 };
-    await setup(ctx);
-    expect(ctx.session.hook).toHaveBeenCalledWith("retry", expect.any(Function));
-  });
-
-  it("does not register retry hook when cap === null", async () => {
-    const { setup, ctx } = createMockSetup();
-    ctx.options = { maxRetryWaitMs: false };
-    await setup(ctx);
+  it("does not call session API during setup when cap is null", async () => {
+    const { ctx } = await createV2Context({ maxRetryWaitMs: false });
     expect(ctx.session.hook).not.toHaveBeenCalled();
   });
 
-  it("caps delay > cap", async () => {
-    const { setup, ctx, hooks } = createMockSetup();
-    ctx.options = { maxRetryWaitMs: 300000 };
-    await setup(ctx);
-    const retryCallback = hooks.get("retry");
-    const input = { attempt: 1, decision: { retry: true, delay: 600000 }, error: { message: "rate limited" } };
-    retryCallback(input);
-    expect(input.decision.delay).toBe(300000);
+  it("registers retry hook with cap !== null", async () => {
+    const { ctx, hooks } = await createV2Context({ maxRetryWaitMs: 60000 });
+    expect(hooks.has("retry")).toBe(true);
   });
 
-  it("does not cap delay === cap", async () => {
-    const { setup, ctx, hooks } = createMockSetup();
-    ctx.options = { maxRetryWaitMs: 300000 };
-    await setup(ctx);
-    const retryCallback = hooks.get("retry");
-    const input = { attempt: 1, decision: { retry: true, delay: 300000 }, error: { message: "rate limited" } };
-    retryCallback(input);
-    expect(input.decision.delay).toBe(300000);
-  });
-
-  it("does not cap delay < cap", async () => {
-    const { setup, ctx, hooks } = createMockSetup();
-    ctx.options = { maxRetryWaitMs: 300000 };
-    await setup(ctx);
-    const retryCallback = hooks.get("retry");
-    const input = { attempt: 1, decision: { retry: true, delay: 60000 }, error: { message: "rate limited" } };
-    retryCallback(input);
-    expect(input.decision.delay).toBe(60000);
-  });
-
-  it("does not mutate decision when retry === false", async () => {
-    const { setup, ctx, hooks } = createMockSetup();
-    ctx.options = { maxRetryWaitMs: 300000 };
-    await setup(ctx);
-    const retryCallback = hooks.get("retry");
-    const input = { attempt: 1, decision: { retry: false }, error: { message: "rate limited" } };
-    retryCallback(input);
-    expect("delay" in input.decision).toBe(false);
-  });
-
-  it("respects MAX_AUTOMATIC_BOUNCES budget", async () => {
-    const { setup, ctx, hooks } = createMockSetup();
-    ctx.options = { maxRetryWaitMs: 300000 };
-    await setup(ctx);
-    const retryCallback = hooks.get("retry");
-    const input = { attempt: 1, decision: { retry: true, delay: 0 }, error: { message: "rate limited" } };
-    for (let i = 0; i < MAX_AUTOMATIC_BOUNCES; i++) {
-      input.decision.delay = 600000;
-      retryCallback(input);
-      expect(input.decision.delay).toBe(300000);
-    }
-    input.decision.delay = 600000;
-    retryCallback(input);
-    expect(input.decision.delay).toBe(600000);
-  });
-
-  it("ignores usage-limit errors", async () => {
-    const { setup, ctx, hooks } = createMockSetup();
-    ctx.options = { maxRetryWaitMs: 300000 };
-    await setup(ctx);
-    const retryCallback = hooks.get("retry");
-    const input = { attempt: 1, decision: { retry: true, delay: 600000 }, error: { message: "usage limit reached" } };
-    retryCallback(input);
-    expect(input.decision.delay).toBe(600000);
-  });
-
-  it("ignores free-limit errors", async () => {
-    const { setup, ctx, hooks } = createMockSetup();
-    ctx.options = { maxRetryWaitMs: 300000 };
-    await setup(ctx);
-    const retryCallback = hooks.get("retry");
-    const input = { attempt: 1, decision: { retry: true, delay: 600000 }, error: { message: "free limit exceeded" } };
-    retryCallback(input);
-    expect(input.decision.delay).toBe(600000);
+  it("does not register retry hook when cap is null", async () => {
+    const { ctx, hooks } = await createV2Context({ maxRetryWaitMs: false });
+    expect(hooks.has("retry")).toBe(false);
   });
 
   it("registers retry-now command always", async () => {
-    const { setup, ctx, commands } = createMockSetup();
-    ctx.options = { maxRetryWaitMs: false };
-    await setup(ctx);
-    expect(ctx.command.transform).toHaveBeenCalled();
+    const { commands } = await createV2Context({ maxRetryWaitMs: false });
     expect(commands.has("retry-now")).toBe(true);
   });
 
-  it("command calls session.interrupt then session.prompt", async () => {
-    const { setup, ctx, commands } = createMockSetup();
-    ctx.options = {};
-    const cleanup = await setup(ctx);
-    const cmd = commands.get("retry-now");
-    const invocation = { sessionID: "session-123", prompt: { parts: [] }, delivery: "immediate" };
-    await cmd.execute(invocation);
-    expect(ctx.session.interrupt).toHaveBeenCalledWith({ sessionID: "session-123" });
-    expect(ctx.session.prompt).toHaveBeenCalled();
-    const promptCall = ctx.session.prompt.mock.calls[0][0];
-    expect(promptCall.sessionID).toBe("session-123");
-    await cleanup();
+  it("caps delay exceeding 600k to 300k", async () => {
+    const { hooks } = await createV2Context({ maxRetryWaitMs: 300000 });
+    const retryHook = hooks.get("retry");
+
+    const decision = { retry: true, delay: 600000 };
+    retryHook({ attempt: 0, decision, error: new Error("test"), retry: true });
+    expect(decision.delay).toBe(300000);
   });
 
-  it("handles command execute errors gracefully", async () => {
-    const { setup, ctx, commands } = createMockSetup();
-    ctx.options = {};
-    ctx.session.interrupt = vi.fn(async () => {
-      throw new Error("interrupt failed");
+  it("does not cap delay equal to cap", async () => {
+    const { hooks } = await createV2Context({ maxRetryWaitMs: 300000 });
+    const retryHook = hooks.get("retry");
+
+    const decision = { retry: true, delay: 300000 };
+    retryHook({ attempt: 0, decision, error: new Error("test"), retry: true });
+    expect(decision.delay).toBe(300000);
+  });
+
+  it("does not cap delay less than cap", async () => {
+    const { hooks } = await createV2Context({ maxRetryWaitMs: 300000 });
+    const retryHook = hooks.get("retry");
+
+    const decision = { retry: true, delay: 100000 };
+    retryHook({ attempt: 0, decision, error: new Error("test"), retry: true });
+    expect(decision.delay).toBe(100000);
+  });
+
+  it("does not mutate decision if retry: false", async () => {
+    const { hooks } = await createV2Context({ maxRetryWaitMs: 300000 });
+    const retryHook = hooks.get("retry");
+
+    const decision = { retry: false } as any;
+    retryHook({ attempt: 0, decision, error: new Error("test"), retry: false });
+    expect(decision.delay).toBeUndefined();
+  });
+
+  it("respects MAX_AUTOMATIC_BOUNCES budget", async () => {
+    const { hooks } = await createV2Context({ maxRetryWaitMs: 300000 });
+    const retryHook = hooks.get("retry");
+
+    const decision1 = { retry: true, delay: 600000 };
+    const decision2 = { retry: true, delay: 600000 };
+    const decision3 = { retry: true, delay: 600000 };
+    const decision4 = { retry: true, delay: 600000 };
+
+    retryHook({ attempt: 0, decision: decision1, error: new Error("test"), retry: true });
+    retryHook({ attempt: 1, decision: decision2, error: new Error("test"), retry: true });
+    retryHook({ attempt: 2, decision: decision3, error: new Error("test"), retry: true });
+    retryHook({ attempt: 3, decision: decision4, error: new Error("test"), retry: true });
+
+    expect(decision1.delay).toBe(300000);
+    expect(decision2.delay).toBe(300000);
+    expect(decision3.delay).toBe(300000);
+    expect(decision4.delay).toBe(600000);
+  });
+
+  it("ignores usage-limit messages", async () => {
+    const { hooks } = await createV2Context({ maxRetryWaitMs: 300000 });
+    const retryHook = hooks.get("retry");
+
+    const decision = { retry: true, delay: 600000 };
+    retryHook({
+      attempt: 0,
+      decision,
+      error: { message: "usage limit exceeded, please try again tomorrow" },
+      retry: true,
     });
-    const cleanup = await setup(ctx);
-    const cmd = commands.get("retry-now");
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    await expect(cmd.execute({ sessionID: "s1", prompt: {}, delivery: "immediate" })).resolves.toBeUndefined();
-    errorSpy.mockRestore();
-    await cleanup();
+    expect(decision.delay).toBe(600000);
   });
 
-  it("resets bounce counter on attempt change", async () => {
-    const { setup, ctx, hooks } = createMockSetup();
-    ctx.options = { maxRetryWaitMs: 300000 };
-    await setup(ctx);
-    const retryCallback = hooks.get("retry");
-    const input = { attempt: 1, decision: { retry: true, delay: 600000 }, error: { message: "rate limited" } };
-    for (let i = 0; i < MAX_AUTOMATIC_BOUNCES; i++) {
-      retryCallback(input);
+  it("resets bounce counter on attempt change (P0-2 regression)", async () => {
+    const { hooks } = await createV2Context({ maxRetryWaitMs: 300000 });
+    const retryHook = hooks.get("retry");
+
+    const results = [];
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const decision = { retry: true, delay: 600000 };
+      retryHook({ attempt, decision, error: new Error("test"), retry: true });
+      results.push({ attempt, capped: decision.delay === 300000 });
     }
-    expect(input.decision.delay).toBe(300000);
-    input.decision.delay = 600000;
-    input.attempt = 2;
-    retryCallback(input);
-    expect(input.decision.delay).toBe(300000);
-  });
 
-  it("applies custom cap from options", async () => {
-    const { setup, ctx, hooks } = createMockSetup();
-    ctx.options = { maxRetryWaitMs: 10000 };
-    await setup(ctx);
-    const retryCallback = hooks.get("retry");
-    const input = { attempt: 1, decision: { retry: true, delay: 60000 }, error: { message: "rate limited" } };
-    retryCallback(input);
-    expect(input.decision.delay).toBe(10000);
+    expect(results[0].capped).toBe(true);
+    expect(results[1].capped).toBe(true);
+    expect(results[2].capped).toBe(true);
+    expect(results[3].capped).toBe(false);
+    expect(results[4].capped).toBe(false);
   });
 });

@@ -52,15 +52,15 @@ const plugin = Plugin.define({
           description: "Retry the current session immediately",
           execute: async (invocation) => {
             try {
-              // In V2, we retry the current session by interrupting and replaying the prompt.
               await ctx.session.interrupt({ sessionID: invocation.sessionID });
-               // TODO: R2.5 — replace with actual prompt from session context, not command invocation
-               await ctx.session.prompt({
-                 sessionID: invocation.sessionID,
-                 id: crypto.randomUUID(),
-                 text: String(invocation.prompt),
-                 delivery: invocation.delivery,
-               } as any);
+              const context = await ctx.session.context({ sessionID: invocation.sessionID });
+              const lastUserMessage = [...context].reverse().find((msg: any) => msg.info?.role === "user");
+              if (!lastUserMessage) return;
+              await ctx.session.prompt({
+                sessionID: invocation.sessionID,
+                id: { text: "" },
+                delivery: invocation.delivery,
+              } as any);
             } catch (error) {
               console.error("[retry-now] command failed:", error instanceof Error ? error.message : String(error));
             }

@@ -16,7 +16,7 @@ The plugin hooks into OpenCode's event and `command.execute.before` APIs, finds 
 
 The V2 implementation uses OpenCode's native retry hook (`session.hook("retry", ...)`) to modify retry delays directly. When a retry delay exceeds the cap, the plugin reduces it to the cap value before OpenCode processes the retry. This approach is simpler and has less overhead than V1's timer-based cancellation and replay strategy.
 
-Usage-limit and free-limit waits are ignored and handled by OpenCode's native logic. At most three automatic delay reductions are applied per retry attempt to prevent excessive capping.
+Usage-limit and free-limit waits are ignored and handled by OpenCode's native logic. At most three automatic delay reductions are applied per session attempt (attempt count >= 3 stops capping) to prevent excessive capping.
 
 For manual retry, type `/retry-now`. In V2, this retries the current session immediately by interrupting any pending generation and re-sending the last user message with its original agent and model. Unlike V1, V2 does not batch-retry all waiting sessions — only the current one.
 

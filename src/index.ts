@@ -326,7 +326,7 @@ const plugin: Plugin = async ({ client, directory }, options) => {
       bouncesInFlight.clear();
     },
 
-    "command.execute.before": async (input: any, output: any) => {
+    "command.execute.before": async (input, output) => {
       if (input.command !== "retry-now") return;
 
       // Get current session's user parts + all session statuses in parallel.
@@ -381,7 +381,7 @@ const plugin: Plugin = async ({ client, directory }, options) => {
 
       // Reuse the command's text-part ID. All other parts are prompt inputs, so
       // OpenCode assigns fresh IDs when it creates the replacement message.
-      const commandTextPart = output.parts.find((part: any) => part.type === "text");
+      const commandTextPart = output.parts.find((part) => part.type === "text");
       const commandParts = currentPrompt.parts.map((part) => ({ ...part }));
       const firstTextIndex = commandParts.findIndex((part) => part.type === "text");
       if (commandTextPart && commandTextPart.type === "text" && firstTextIndex !== -1) {

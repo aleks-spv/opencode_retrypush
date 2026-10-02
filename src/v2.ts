@@ -1,27 +1,18 @@
-/// <reference path="./types/opencode-v2.d.ts" />
-import { define, type Plugin } from "@opencode/plugin";
+import { Plugin } from "@opencode/plugin";
 import { parseMaxRetryWaitMs, shouldCapDelay, isUsageLimitMessage, MAX_AUTOMATIC_BOUNCES } from "./shared.js";
 
-const plugin = define({
+const plugin = Plugin.define({
   id: "retry-now",
   setup: async (ctx) => {
     const cap = parseMaxRetryWaitMs(ctx.options);
     const registrations: Array<{ dispose: () => Promise<void> | void }> = [];
-    let attempt = -1;
-    let bouncesInThisAttempt = 0;
 
     // Hook into session retry events to cap delays.
     if (cap !== null) {
       try {
         const retryReg = await ctx.session.hook("retry", (input) => {
-          try {
-            // Track attempt: if it changes, reset bounce counter.
-            if (input.attempt !== attempt) {
-              attempt = input.attempt;
-              bouncesInThisAttempt = 0;
-            }
-
-            // Ignore usage-limit/free-limit retries — let OpenCode handle them.
+           try {
+             // Ignore usage-limit/free-limit retries — let OpenCode handle them.
             const errorMessage = typeof input.error === "object" && input.error !== null && "message" in input.error
               ? (input.error as { message?: unknown }).message
               : undefined;
@@ -29,21 +20,20 @@ const plugin = define({
               return;
             }
 
-            // Ignore if we've already bounced 3 times on this attempt.
-            if (bouncesInThisAttempt >= MAX_AUTOMATIC_BOUNCES) {
-              return;
-            }
+             // Ignore if we've reached the automatic retry limit.
+             if (input.attempt >= MAX_AUTOMATIC_BOUNCES) {
+               return;
+             }
 
             // Only cap if the decision is to retry (has a delay).
             if (!input.decision.retry) {
               return;
             }
 
-            // Cap the delay if it exceeds our limit.
-            if (shouldCapDelay(input.decision.delay, cap)) {
-              input.decision.delay = cap;
-              bouncesInThisAttempt++;
-            }
+             // Cap the delay if it exceeds our limit.
+             if (shouldCapDelay(input.decision.delay, cap)) {
+               input.decision.delay = cap;
+             }
           } catch (error) {
             console.error("[retry-now]", error instanceof Error ? error.message : String(error));
           }
@@ -64,11 +54,13 @@ const plugin = define({
             try {
               // In V2, we retry the current session by interrupting and replaying the prompt.
               await ctx.session.interrupt({ sessionID: invocation.sessionID });
-              await ctx.session.prompt({
-                sessionID: invocation.sessionID,
-                prompt: invocation.prompt,
-                delivery: invocation.delivery,
-              } as any);
+               // TODO: R2.5 — replace with actual prompt from session context, not command invocation
+               await ctx.session.prompt({
+                 sessionID: invocation.sessionID,
+                 id: crypto.randomUUID(),
+                 text: String(invocation.prompt),
+                 delivery: invocation.delivery,
+               } as any);
             } catch (error) {
               console.error("[retry-now] command failed:", error instanceof Error ? error.message : String(error));
             }

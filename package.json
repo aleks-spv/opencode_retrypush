@@ -29,7 +29,7 @@
   "author": "aleks-spv",
   "repository": {
     "type": "git",
-    "url": "https://github.com/aleks-spv/opencode_retrypush.git"
+    "url": "git+https://github.com/aleks-spv/opencode_retrypush.git"
   },
   "files": [
     "dist",
@@ -41,9 +41,27 @@
     "@opencode-ai/sdk": "^1.18.34",
     "@opencode/client": "2.0.21",
     "@opencode/plugin": "2.0.21",
-    "@types/node": "^20.0.0",
-    "eslint": "^10.11.0",
-    "typescript": "^5.0.0",
-    "vitest": "^1.0.0"
-  }
+    "@types/node": "^20.19.43",
+    "typescript": "^5.9.3",
+    "vitest": "^1.6.1"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.15.7",
+    "@opencode/plugin": ">=2.0.21"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": {
+      "optional": true
+    },
+    "@opencode/plugin": {
+      "optional": true
+    }
+  },
+  "directories": {
+    "test": "test"
+  },
+  "bugs": {
+    "url": "https://github.com/aleks-spv/opencode_retrypush/issues"
+  },
+  "homepage": "https://github.com/aleks-spv/opencode_retrypush#readme"
 }

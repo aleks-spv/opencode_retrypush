@@ -9,6 +9,7 @@ package-lock.json
 
 # Internal AI agent files
 AGENTS.md
+.omo/
 
 # Dev scratch files
 test-plugin.ts
@@ -47,3 +48,6 @@ yarn-error.log*
 
 # Vitest cache
 .vitest/
+
+# Compiled JS in source dir (should be in dist/)
+src/*.js

@@ -299,7 +299,7 @@ describe("retry-now plugin", () => {
         promptAsync: vi.fn().mockResolvedValue({}),
       },
     };
-    const hooks = await RetryNowPlugin({ client, directory: "/my/project", project: {} as any, worktree: "", experimental_workspace: {} as any, serverUrl: new URL("http://localhost"), $: {} as any });
+    const hooks = await RetryNowPlugin({ client: client as any, directory: "/my/project", project: {} as any, worktree: "", experimental_workspace: {} as any, serverUrl: new URL("http://localhost"), $: {} as any });
     const hook = hooks["command.execute.before"];
     if (!hook) throw new Error("no hook");
 

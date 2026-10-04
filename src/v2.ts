@@ -53,14 +53,25 @@ const plugin = Plugin.define({
           execute: async (invocation) => {
             try {
               await ctx.session.interrupt({ sessionID: invocation.sessionID });
-              const context = await ctx.session.context({ sessionID: invocation.sessionID });
-              const lastUserMessage = [...context].reverse().find((msg: any) => msg.info?.role === "user");
-              if (!lastUserMessage) return;
+              const messages = await ctx.session.context({ sessionID: invocation.sessionID });
+              const lastUser = [...messages].reverse().find((message) => message.type === "user");
+              if (!lastUser) return;
+
+              const files: Array<{ uri: string; name?: string; description?: string; mention?: { start: number; end: number; text: string } }> = [];
+              for (const f of lastUser.files ?? []) {
+                if (f.source.type === "uri") {
+                  files.push({ uri: f.source.uri, name: f.name, description: f.description, mention: f.mention });
+                }
+              }
+
               await ctx.session.prompt({
                 sessionID: invocation.sessionID,
-                id: { text: "" },
+                text: lastUser.text,
                 delivery: invocation.delivery,
-              } as any);
+                ...(lastUser.agents?.length ? { agents: lastUser.agents.map((a) => ({ name: a.name, mention: a.mention })) } : {}),
+                ...(lastUser.skills?.length ? { skills: lastUser.skills.map((s) => ({ id: s.id, mention: s.mention })) } : {}),
+                ...(files.length ? { files } : {}),
+              });
             } catch (error) {
               console.error("[retry-now] command failed:", error instanceof Error ? error.message : String(error));
             }

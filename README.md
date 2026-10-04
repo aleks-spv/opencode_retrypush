@@ -16,9 +16,9 @@ The plugin hooks into OpenCode's event and `command.execute.before` APIs, finds 
 
 The V2 implementation uses OpenCode's native retry hook (`session.hook("retry", ...)`) to modify retry delays directly. When a retry delay exceeds the cap, the plugin reduces it to the cap value before OpenCode processes the retry. This approach is simpler and has less overhead than V1's timer-based cancellation and replay strategy.
 
-Usage-limit and free-limit waits are ignored and handled by OpenCode's native logic. At most three automatic delay reductions are applied per session attempt (attempt count >= 3 stops capping) to prevent excessive capping.
+Usage-limit and free-limit waits are ignored and handled by OpenCode's native logic. At most three automatic delay reductions are applied per session attempt (the native `SessionRetry.attempt` counter — whether it starts at `0` or at `1` is **unconfirmed**, so the actual number of shortened waits is three or four) to prevent excessive capping.
 
-For manual retry, type `/retry-now`. In V2, this retries the current session immediately by interrupting any pending generation and re-sending the last user message with its original agent and model. Unlike V1, V2 does not batch-retry all waiting sessions — only the current one.
+For manual retry, type `/retry-now`. In V2, this retries the current session immediately by interrupting any pending generation and re-sending the **text** of the last user message, plus any agent and skill mentions and file attachments **that reference a URI**. Inline (base64) attachments are not transferred because `SessionPromptInput.files` accepts only `uri`. The V2 prompt API has no `agent` or `model` fields, so the retry runs under the current session's agent and model — not the ones recorded in the original message. Unlike V1, V2 does not batch-retry all waiting sessions — it retries only the current session.
 
 ## Installation
 
@@ -109,6 +109,8 @@ Or use the published package path:
 }
 ```
 
+> **unconfirmed:** The V2 config format shown above — a `plugins` array with `package`/`options` keys — is **unconfirmed** against a live OpenCode V2 build. It was derived from the shape of the `@opencode/plugin@2.0.21` package; if OpenCode rejects it, check the actual plugin-registration key in the V2 release notes.
+
 `maxRetryWaitMs` is optional and defaults to `300000` (five minutes). Set a positive millisecond value to change the cap, or `false` to disable automatic retry capping while keeping `/retry-now` available.
 
 ### 3. Restart OpenCode
@@ -119,7 +121,15 @@ Config and plugins are loaded once on startup — restart is required. Unlike V1
 
 ## Usage
 
-When rate-limited, type `/retry-now` in any session and press Enter. The command retries every session currently waiting on a rate-limit countdown, including child sessions.
+When rate-limited, type `/retry-now` in any session and press Enter.
+
+### OpenCode V1
+
+Retries the current session plus every other session waiting on a rate-limit countdown, including child sessions, each with its original agent and model.
+
+### OpenCode V2
+
+Retries only the current session, replaying the text of its last user message along with agent and skill mentions and URI-referenced file attachments. The retry runs under the current session's agent and model — the V2 prompt API has no fields to override them.
 
 ## Requirements
 
@@ -144,6 +154,6 @@ You can bind `/retry-now` to a keyboard shortcut so you don't have to type it. O
 }
 ```
 
-Pressing the shortcut types `/retry-now` into the prompt and submits it, retrying every rate-limited session immediately. `ctrl+alt+r` is a suggested default — pick any combo that does not collide with your terminal's bindings.
+Pressing the shortcut types `/retry-now` into the prompt and submits it. In V1 this retries every session waiting on a rate-limit countdown; in V2 it retries only the current session. `ctrl+alt+r` is a suggested default — pick any combo that does not collide with your terminal's bindings.
 
 > **Note:** this requires an OpenCode version that includes [PR #5903](https://github.com/anomalyco/opencode/pull/5903). Until then, use `/retry-now` manually or bind it via your terminal emulator (e.g. a custom escape sequence that opens an input with `/retry-now` typed).
